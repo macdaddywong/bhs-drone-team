@@ -1,0 +1,349 @@
+"""
+Claude generated on 4/9/26
+Color Detection for Raspberry Pi 4 Model B  (pygame display edition)
+=====================================================================
+Fixes:
+  • No Qt / Wayland dependency  — display handled by pygame (works on
+    X11, Wayland, and bare framebuffer via SDL2).
+  • No bundled-font dependency  — labels rendered with pygame TTF fonts
+    (falls back gracefully if no system font is found).
+  • No black-screen on Pi      — pygame initialises SDL2 directly,
+    bypassing the broken Qt platform plugin entirely.
+
+Requirements (install ONCE, system-wide or in your venv):
+    sudo apt update
+    sudo apt install python3-pygame python3-numpy libsdl2-dev
+
+    # Headless OpenCV — no Qt bundled, lighter, correct for Pi:
+    pip install opencv-python-headless numpy
+
+    # Pi Camera support (optional):
+    sudo apt install python3-picamera2
+
+Usage:
+    python color_detection_pi.py                  # USB webcam
+    python color_detection_pi.py --picam          # Pi Camera module
+    python color_detection_pi.py --color green    # start with one color
+    python color_detection_pi.py --fullscreen     # fullscreen mode
+"""
+
+import os
+import sys
+import argparse
+
+# ── Force SDL2 to use the correct video driver before pygame imports ──
+# "x11"     works under LXDE / Raspbian desktop (X11 session)
+# "wayland" works under Wayfire / labwc (Bookworm default compositor)
+# The user can override with:  SDL_VIDEODRIVER=x11 python ...
+if "SDL_VIDEODRIVER" not in os.environ:
+    if os.environ.get("WAYLAND_DISPLAY"):
+        os.environ["SDL_VIDEODRIVER"] = "wayland"
+    else:
+        os.environ.setdefault("SDL_VIDEODRIVER", "x11")
+
+import cv2          # opencv-python-headless  (no Qt!)
+import numpy as np
+import pygame
+import pygame.font
+
+# ──────────────────────────────────────────────
+# HSV Color Ranges   (Hue 0-179, Sat/Val 0-255)
+# ──────────────────────────────────────────────
+COLOR_RANGES = {
+    "red": [
+        (np.array([0,   120,  70]), np.array([10,  255, 255])),
+        (np.array([170, 120,  70]), np.array([180, 255, 255])),  # hue wrap
+    ],
+    "orange": [(np.array([10, 120,  70]), np.array([25,  255, 255]))],
+    "yellow": [(np.array([25, 100,  70]), np.array([35,  255, 255]))],
+    "green":  [(np.array([36, 100,  70]), np.array([86,  255, 255]))],
+    "blue":   [(np.array([94, 100,  70]), np.array([126, 255, 255]))],
+    "purple": [(np.array([127, 50,  70]), np.array([155, 255, 255]))],
+    "white":  [(np.array([0,    0, 200]), np.array([180,  30, 255]))],
+    "black":  [(np.array([0,    0,   0]), np.array([180, 255,  50]))],
+}
+
+# RGB colors for pygame drawing
+DISPLAY_RGB = {
+    "red":    (220,   0,   0),
+    "orange": (255, 140,   0),
+    "yellow": (220, 220,   0),
+    "green":  ( 30, 200,  60),
+    "blue":   (  0,  80, 220),
+    "purple": (160,   0, 180),
+    "white":  (230, 230, 230),
+    "black":  ( 60,  60,  60),
+}
+
+LABEL_TEXT_DARK  = (10,  10,  10)
+LABEL_TEXT_LIGHT = (240, 240, 240)
+DARK_LABELS = {"black", "blue", "purple"}
+
+MIN_AREA  = 1500
+FRAME_W   = 640
+FRAME_H   = 480
+HUD_H     = 36
+PILL_H    = 22
+
+
+# ──────────────────────────────────────────────
+# Camera helpers
+# ──────────────────────────────────────────────
+
+def open_usb_camera(index: int = 0):
+    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(index)
+    if not cap.isOpened():
+        sys.exit(f"[ERROR] Cannot open USB camera at index {index}.")
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    cap.set(cv2.CAP_PROP_FPS, 30)
+    print(f"[INFO] USB camera opened (index={index}).")
+    return cap
+
+
+def open_pi_camera():
+    try:
+        from picamera2 import Picamera2  # type: ignore
+    except ImportError:
+        sys.exit(
+            "[ERROR] picamera2 not installed.\n"
+            "Run:  sudo apt install python3-picamera2"
+        )
+    cam = Picamera2()
+    cfg = cam.create_preview_configuration(
+        main={"size": (FRAME_W, FRAME_H), "format": "BGR888"}
+    )
+    cam.configure(cfg)
+    cam.start()
+    print("[INFO] Pi Camera opened via picamera2.")
+    return cam
+
+
+def grab_frame(source, use_picam: bool) -> np.ndarray:
+    if use_picam:
+        return source.capture_array()
+    ret, frame = source.read()
+    if not ret:
+        sys.exit("[ERROR] Camera read failed.")
+    return frame
+
+
+def release_camera(source, use_picam: bool):
+    if use_picam:
+        source.stop()
+    else:
+        source.release()
+
+
+# ──────────────────────────────────────────────
+# Detection  (pure OpenCV / numpy)
+# ──────────────────────────────────────────────
+
+def build_mask(hsv: np.ndarray, color_name: str) -> np.ndarray:
+    mask   = np.zeros(hsv.shape[:2], dtype=np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+    for lo, hi in COLOR_RANGES[color_name]:
+        mask |= cv2.inRange(hsv, lo, hi)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,  kernel, iterations=2)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
+    return mask
+
+
+def find_detections(frame: np.ndarray, active_colors: list) -> list:
+    hsv        = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    detections = []
+    for color_name in active_colors:
+        mask        = build_mask(hsv, color_name)
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < MIN_AREA:
+                continue
+            x, y, w, h = cv2.boundingRect(cnt)
+            detections.append({
+                "color":  color_name,
+                "rect":   (x, y, w, h),
+                "center": (x + w // 2, y + h // 2),
+                "area":   int(area),
+            })
+    return detections
+
+
+# ──────────────────────────────────────────────
+# pygame rendering
+# ──────────────────────────────────────────────
+
+def cv2_to_pygame(frame: np.ndarray) -> pygame.Surface:
+    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    return pygame.surfarray.make_surface(rgb.swapaxes(0, 1))
+
+
+def draw_detections(surface: pygame.Surface, detections: list, font: pygame.font.Font):
+    for d in detections:
+        rgb         = DISPLAY_RGB[d["color"]]
+        x, y, w, h = d["rect"]
+        cx, cy      = d["center"]
+
+        pygame.draw.rect(surface, rgb, (x, y, w, h), 2)
+        pygame.draw.circle(surface, rgb, (cx, cy), 6)
+
+        label_str = f"{d['color']}  {d['area']}px"
+        txt_color = LABEL_TEXT_LIGHT if d["color"] in DARK_LABELS else LABEL_TEXT_DARK
+        txt_surf  = font.render(label_str, True, txt_color)
+        tw, th    = txt_surf.get_size()
+        pad       = 4
+        lx        = x
+        ly        = max(0, y - th - pad * 2)
+
+        bg = pygame.Surface((tw + pad * 2, th + pad * 2), pygame.SRCALPHA)
+        r, g, b = rgb
+        bg.fill((r, g, b, 200))
+        surface.blit(bg, (lx, ly))
+        surface.blit(txt_surf, (lx + pad, ly + pad))
+
+
+def draw_hud(surface: pygame.Surface, active: list, all_colors: list,
+             font: pygame.font.Font, win_w: int, win_h: int):
+    # Bottom bar
+    bar_bg = pygame.Surface((win_w, HUD_H), pygame.SRCALPHA)
+    bar_bg.fill((20, 20, 20, 180))
+    surface.blit(bar_bg, (0, win_h - HUD_H))
+    instr = "Keys: [1-8] toggle  [A] all  [N] none  [Q] quit"
+    txt   = font.render(instr, True, (200, 200, 200))
+    surface.blit(txt, (8, win_h - HUD_H + (HUD_H - txt.get_height()) // 2))
+
+    # Top pills
+    pill_x = 6
+    for i, name in enumerate(all_colors):
+        is_active = name in active
+        rgb       = DISPLAY_RGB[name] if is_active else (80, 80, 80)
+        label     = f"{i+1}:{name}"
+        txt_color = LABEL_TEXT_LIGHT if (not is_active or name in DARK_LABELS) else LABEL_TEXT_DARK
+        txt_surf  = font.render(label, True, txt_color)
+        tw, th    = txt_surf.get_size()
+        pad       = 4
+        rect      = pygame.Rect(pill_x, 4, tw + pad * 2, PILL_H)
+
+        if is_active:
+            pygame.draw.rect(surface, rgb, rect, border_radius=4)
+        else:
+            pygame.draw.rect(surface, rgb, rect, 1, border_radius=4)
+
+        surface.blit(txt_surf, (rect.x + pad, rect.y + (PILL_H - th) // 2))
+        pill_x += rect.w + 6
+
+
+def load_font(size: int) -> pygame.font.Font:
+    candidates = [
+        "dejavusans", "dejavusansmono", "freesans", "liberationsans",
+        "ubuntu", "noto", "Arial", "Helvetica",
+    ]
+    for name in candidates:
+        try:
+            path = pygame.font.match_font(name)
+            if path:
+                return pygame.font.Font(path, size)
+        except Exception:
+            pass
+    return pygame.font.SysFont(None, size)  # built-in fallback
+
+
+# ──────────────────────────────────────────────
+# Main loop
+# ──────────────────────────────────────────────
+
+def run(use_picam: bool = False, initial_color: str = None, fullscreen: bool = False):
+    all_colors    = list(COLOR_RANGES.keys())
+    active_colors = [initial_color] if initial_color else list(all_colors)
+
+    source = open_pi_camera() if use_picam else open_usb_camera()
+
+    # Grab a frame to learn the actual resolution
+    test           = grab_frame(source, use_picam)
+    actual_h, actual_w = test.shape[:2]
+    win_w, win_h   = actual_w, actual_h + HUD_H
+
+    pygame.init()
+    pygame.font.init()
+
+    flags = pygame.FULLSCREEN if fullscreen else 0
+    try:
+        screen = pygame.display.set_mode((win_w, win_h), flags)
+    except pygame.error as e:
+        pygame.quit()
+        release_camera(source, use_picam)
+        sys.exit(
+            f"[ERROR] pygame display failed: {e}\n"
+            "Try setting the environment variable before running:\n"
+            "  export SDL_VIDEODRIVER=x11      (for X11 desktop)\n"
+            "  export SDL_VIDEODRIVER=wayland  (for Wayland desktop)\n"
+            "  export SDL_VIDEODRIVER=kmsdrm   (for headless / framebuffer)"
+        )
+
+    pygame.display.set_caption("Color Detection  —  Pi 4B")
+    clock      = pygame.time.Clock()
+    font_label = load_font(16)
+    font_hud   = load_font(14)
+
+    print("\n[INFO] Running — press Q or close window to quit.")
+    print("  Keys 1-8  toggle individual colors")
+    print("  A         enable all   |   N  disable all\n")
+
+    running = True
+    while running:
+        for event in pygame.event.get():
+            if event.type == pygame.QUIT:
+                running = False
+            elif event.type == pygame.KEYDOWN:
+                if event.key == pygame.K_q:
+                    running = False
+                elif event.key == pygame.K_a:
+                    active_colors = list(all_colors)
+                elif event.key == pygame.K_n:
+                    active_colors = []
+                elif pygame.K_1 <= event.key <= pygame.K_8:
+                    idx  = event.key - pygame.K_1
+                    name = all_colors[idx]
+                    if name in active_colors:
+                        active_colors.remove(name)
+                        print(f"[INFO] Disabled: {name}")
+                    else:
+                        active_colors.append(name)
+                        print(f"[INFO] Enabled:  {name}")
+
+        frame      = grab_frame(source, use_picam)
+        detections = find_detections(frame, active_colors)
+        cam_surf   = cv2_to_pygame(frame)
+
+        screen.blit(cam_surf, (0, 0))
+        draw_detections(screen, detections, font_label)
+        draw_hud(screen, active_colors, all_colors, font_hud, win_w, win_h)
+
+        pygame.display.flip()
+        clock.tick(30)
+
+    pygame.quit()
+    release_camera(source, use_picam)
+    print("[INFO] Done.")
+
+
+# ──────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="Real-time color detection on Raspberry Pi 4B (pygame display)."
+    )
+    parser.add_argument("--picam",      action="store_true",
+                        help="Use the Raspberry Pi Camera module.")
+    parser.add_argument("--color",      type=str, default=None,
+                        choices=list(COLOR_RANGES.keys()),
+                        help="Detect only this color at startup (default: all).")
+    parser.add_argument("--fullscreen", action="store_true",
+                        help="Run in fullscreen mode.")
+    args = parser.parse_args()
+
+    run(use_picam=args.picam, initial_color=args.color, fullscreen=args.fullscreen)
