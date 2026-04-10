@@ -12,3 +12,6 @@ to set things up.
 
 I'm also using uv.
 https://docs.astral.sh/uv/
+
+4/10 Update
+For the Raspberry Pi 4, we updated the OS to Trixi, and the 2nd verion of the color detection program uses Pygame, and we were able successfuly run it with that change
